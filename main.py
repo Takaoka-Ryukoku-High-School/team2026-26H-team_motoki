@@ -1,7 +1,6 @@
 import hashlib
 import json
 import re
-import shutil
 import urllib.parse
 import urllib.request
 from datetime import date
@@ -46,40 +45,31 @@ def normalize(value):
     return re.sub(r"[\s　]+", "", (value or "")).casefold()
 
 
-def fetch_web_products(query):
-    params = urllib.parse.urlencode({
-        "action": "query",
-        "format": "json",
-        "generator": "search",
-        "gsrsearch": query,
-        "gsrlimit": 6,
-        "gsrnamespace": 0,
-        "prop": "pageimages|info",
-        "piprop": "thumbnail",
-        "pithumbsize": 180,
-        "inprop": "url",
-    })
-    request = urllib.request.Request(
-        f"https://ja.wikipedia.org/w/api.php?{params}",
-        headers={"User-Agent": "GoodsOrganizer/1.0"},
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=8) as response:
-            payload = json.load(response)
-    except (OSError, TimeoutError, json.JSONDecodeError):
-        return []
-    products = []
-    for page in (payload.get("query", {}).get("pages", {}) or {}).values():
-        thumbnail = page.get("thumbnail") or {}
-        products.append({
-            "name": page.get("title", "名称未登録"),
-            "brand": "Wikipedia",
-            "image": thumbnail.get("source", ""),
-            "image_path": "",
-            "barcode": "",
-            "url": page.get("fullurl", ""),
-        })
-    return products
+def item_purchase_status(item):
+    return item.get("purchase_status", "purchased" if item.get("owned", True) else "planned")
+
+
+def google_shopping_url(query):
+    params = urllib.parse.urlencode({"tbm": "shop", "q": query})
+    return f"https://www.google.com/search?{params}"
+
+
+def save_picked_image(file):
+    content = file.bytes
+    if content is None:
+        if not file.path:
+            raise ValueError("画像データを読み込めませんでした")
+        source = Path(file.path)
+        content = source.read_bytes()
+        suffix = source.suffix
+    else:
+        suffix = Path(file.name).suffix
+
+    digest = hashlib.sha256(content).hexdigest()
+    target = ASSET_DIR / f"{digest}{suffix or '.jpg'}"
+    if not target.exists():
+        target.write_bytes(content)
+    return target, digest
 
 
 def fetch_barcode(code):
@@ -170,7 +160,12 @@ def main(page: ft.Page):
         for item in data["items"]:
             if query_key and query_key not in normalize(item_name(item)):
                 continue
-            status = "所持中" if item.get("owned", True) else "検討中"
+            status = item_purchase_status(item)
+            purchase_summary = (
+                f"購入済み ・ {item.get('quantity', 1)}個"
+                if status == "purchased"
+                else "購入予定"
+            )
             rows.append(
                 ft.Container(
                     content=ft.Row(
@@ -180,7 +175,7 @@ def main(page: ft.Page):
                                 [
                                     ft.Text(item_name(item), size=15, weight=ft.FontWeight.W_600),
                                     ft.Text(
-                                        f"{item.get('barcode') or 'バーコード未登録'} ・ {status} ・ ¥{item.get('price', 0):,}",
+                                        f"{item.get('barcode') or 'バーコード未登録'} ・ {purchase_summary} ・ ¥{item.get('price', 0):,}",
                                         size=12,
                                         color=COLORS["muted"],
                                     ),
@@ -188,6 +183,11 @@ def main(page: ft.Page):
                                 ],
                                 expand=True,
                                 spacing=3,
+                            ),
+                            ft.IconButton(
+                                ft.Icons.EDIT_OUTLINED,
+                                tooltip="登録内容を編集",
+                                on_click=lambda _, value=item: add_manual(value),
                             ),
                             ft.IconButton(ft.Icons.DELETE_OUTLINE, icon_color=COLORS["coral"], tooltip="削除", on_click=lambda event, item_id=item["id"]: delete_item(item_id)),
                         ],
@@ -203,23 +203,49 @@ def main(page: ft.Page):
         collection_view.controls = rows or [ft.Text("該当するグッズはありません", color=COLORS["muted"], text_align=ft.TextAlign.CENTER)]
         page.update()
 
-    async def add_manual(item=None, *args):
+    def add_manual(item=None, *args):
         item = item if isinstance(item, dict) else {}
         name_field = ft.TextField(label="商品名", value=item.get("name", ""), autofocus=True)
         brand_field = ft.TextField(label="ブランド・作品名", value=item.get("brand", ""))
         barcode_field = ft.TextField(label="バーコード", value=item.get("barcode", ""), keyboard_type=ft.KeyboardType.NUMBER)
         price_field = ft.TextField(label="購入金額", value=str(item.get("price", "")), keyboard_type=ft.KeyboardType.NUMBER)
         memo_field = ft.TextField(label="メモ", value=item.get("memo", ""), multiline=True, min_lines=2)
-        owned_field = ft.Checkbox(label="所持中", value=item.get("owned", True))
+        quantity_field = ft.TextField(
+            label="購入個数",
+            value=str(item.get("quantity", 1)),
+            keyboard_type=ft.KeyboardType.NUMBER,
+        )
+        item_image_url = item.get("image", "")
+        image_url_field = ft.TextField(
+            label="商品画像URL（画像アドレスを貼り付け）",
+            value=item_image_url if isinstance(item_image_url, str) and item_image_url.startswith(("http://", "https://")) else "",
+            hint_text="商品ページではなく画像そのもののURL",
+        )
+        purchase_status_field = ft.RadioGroup(
+            content=ft.Column([
+                ft.Radio(value="purchased", label="購入済み"),
+                ft.Radio(value="planned", label="購入予定"),
+            ]),
+            value=item_purchase_status(item),
+        )
         search_name = ft.TextField(label="インターネット検索", hint_text="商品名・作品名", expand=True)
         search_barcode = ft.TextField(label="バーコード検索", hint_text="バーコード数字", expand=True, keyboard_type=ft.KeyboardType.NUMBER)
         search_status = ft.Text(size=12, color=COLORS["muted"])
         search_candidates = ft.Column(spacing=6)
         selected_image = item.get("image", "")
+        selected_image_path = item.get("image_path", "")
+        selected_image_hash = item.get("image_hash", "")
 
         def close(_=None):
             dialog.open = False
             page.update()
+
+        def update_purchase_fields(_=None):
+            quantity_field.visible = purchase_status_field.value == "purchased"
+            page.update()
+
+        purchase_status_field.on_change = update_purchase_fields
+        quantity_field.visible = purchase_status_field.value == "purchased"
 
         def submit(_):
             name = name_field.value.strip()
@@ -231,6 +257,23 @@ def main(page: ft.Page):
             except ValueError:
                 notify("購入金額は数字で入力してください")
                 return
+            try:
+                quantity = int(quantity_field.value or 0)
+            except ValueError:
+                quantity = 0
+            purchase_status = purchase_status_field.value
+            if purchase_status not in ("purchased", "planned"):
+                notify("購入状況を選択してください")
+                return
+            if purchase_status == "purchased" and quantity < 1:
+                notify("購入個数は1以上で入力してください")
+                return
+            image_url = image_url_field.value.strip()
+            if image_url:
+                parsed_image_url = urllib.parse.urlsplit(image_url)
+                if parsed_image_url.scheme not in ("http", "https") or not parsed_image_url.netloc:
+                    notify("画像URLは http:// または https:// から始まるURLを入力してください")
+                    return
             record = {
                 "id": item.get("id") or str(__import__("uuid").uuid4()),
                 "name": name,
@@ -238,10 +281,12 @@ def main(page: ft.Page):
                 "barcode": re.sub(r"\D", "", barcode_field.value),
                 "price": price,
                 "memo": memo_field.value.strip(),
-                "owned": owned_field.value,
-                "image": selected_image,
-                "image_path": item.get("image_path", ""),
-                "image_hash": item.get("image_hash", ""),
+                "purchase_status": purchase_status,
+                "owned": purchase_status == "purchased",
+                "quantity": quantity,
+                "image": image_url or selected_image,
+                "image_path": "" if image_url else selected_image_path,
+                "image_hash": "" if image_url else selected_image_hash,
             }
             existing = next((entry for entry in data["items"] if entry["id"] == record["id"]), None)
             if existing:
@@ -253,11 +298,14 @@ def main(page: ft.Page):
             render_collection()
 
         def apply_candidate(candidate):
-            nonlocal selected_image
+            nonlocal selected_image, selected_image_path, selected_image_hash
             name_field.value = candidate.get("name", "")
             brand_field.value = candidate.get("brand", "")
             barcode_field.value = candidate.get("barcode", "")
-            selected_image = candidate.get("image", "")
+            selected_image = candidate.get("image") or ""
+            selected_image_path = candidate.get("image_path", "")
+            selected_image_hash = candidate.get("image_hash", "")
+            image_url_field.value = selected_image if selected_image.startswith(("http://", "https://")) else ""
             search_status.value = "候補を入力欄に反映しました"
             page.update()
 
@@ -290,15 +338,29 @@ def main(page: ft.Page):
                 search_status.value = "商品名を入力してください"
                 page.update()
                 return
-            search_status.value = "商品名を検索中..."
+            search_status.value = "Google ショッピングでグッズを検索できます"
+            search_candidates.controls = [
+                ft.TextButton(
+                    "Google ショッピングでグッズを検索",
+                    icon=ft.Icons.OPEN_IN_NEW,
+                    url=google_shopping_url(query),
+                ),
+                ft.Button(
+                    "この商品名で選択して登録",
+                    icon=ft.Icons.ADD,
+                    on_click=lambda _: select_search_name(query),
+                ),
+                ft.Text(
+                    "Googleの商品情報は自動取得されません。商品名を登録欄に反映して登録できます。",
+                    size=11,
+                    color=COLORS["muted"],
+                ),
+            ]
             page.update()
-            candidates = fetch_web_products(query)
-            if not candidates:
-                search_status.value = "候補が見つかりませんでした"
-                search_candidates.controls = []
-            else:
-                search_status.value = f"{len(candidates)} 件の候補"
-                render_candidates(candidates)
+
+        def select_search_name(query):
+            name_field.value = query
+            search_status.value = "商品名を登録欄に反映しました"
             page.update()
 
         def search_barcode_online(_):
@@ -319,22 +381,28 @@ def main(page: ft.Page):
             page.update()
 
         async def pick_registration_image(_):
-            files = await image_picker.pick_files(file_type=ft.FilePickerFileType.IMAGE, allow_multiple=False)
+            files = await image_picker.pick_files(
+                file_type=ft.FilePickerFileType.IMAGE,
+                allow_multiple=False,
+                with_data=True,
+            )
             if not files:
                 return
-            source = Path(files[0].path)
-            digest = hashlib.sha256(source.read_bytes()).hexdigest()
-            target = ASSET_DIR / f"{digest}{source.suffix or '.jpg'}"
-            if not target.exists():
-                shutil.copy2(source, target)
-            nonlocal selected_image
-            selected_image = str(target)
-            search_status.value = "画像を選択しました。Google Lensで画像を検索できます"
-            lens_url = f"https://lens.google.com/uploadbyurl?url={urllib.parse.quote(target.as_uri())}"
+            nonlocal selected_image, selected_image_path, selected_image_hash
+            try:
+                target, digest = save_picked_image(files[0])
+            except (OSError, ValueError) as error:
+                notify(f"画像を読み込めませんでした: {error}")
+                return
+            selected_image = ""
+            selected_image_path = str(target)
+            selected_image_hash = digest
+            image_url_field.value = ""
+            search_status.value = "画像を選択しました。この画像もグッズと一緒に登録されます"
             search_candidates.controls = [
                 ft.Row([
                     ft.Image(src=str(target), width=72, height=72, fit=ft.BoxFit.COVER, border_radius=6),
-                    ft.TextButton("画像をネット検索", icon=ft.Icons.OPEN_IN_NEW, url=lens_url),
+                    ft.Text("登録する画像", color=COLORS["muted"]),
                 ]),
             ]
             page.update()
@@ -346,7 +414,7 @@ def main(page: ft.Page):
                     ft.Text("インターネットから検索", weight=ft.FontWeight.W_600, color=COLORS["green"]),
                     ft.Row([search_name, ft.Button("商品名", icon=ft.Icons.SEARCH, on_click=search_name_online)], spacing=8),
                     ft.Row([search_barcode, ft.Button("バーコード", icon=ft.Icons.QR_CODE_SCANNER, on_click=search_barcode_online)], spacing=8),
-                    ft.Row([ft.Button("画像を選ぶ", icon=ft.Icons.PHOTO_CAMERA, on_click=pick_registration_image), ft.Text("画像を保存してネット検索", expand=True, size=12, color=COLORS["muted"])], spacing=8),
+                    ft.Row([ft.Button("画像を選んで登録", icon=ft.Icons.PHOTO_CAMERA, on_click=pick_registration_image), ft.Text("選んだ画像はグッズと一緒に保存されます", expand=True, size=12, color=COLORS["muted"])], spacing=8),
                     search_status,
                     search_candidates,
                     ft.Divider(height=1),
@@ -355,7 +423,15 @@ def main(page: ft.Page):
                     barcode_field,
                     price_field,
                     memo_field,
-                    owned_field,
+                    image_url_field,
+                    ft.Text(
+                        "ショップの「画像アドレスをコピー」から貼り付けるか、画像ファイルを選択してください。",
+                        size=11,
+                        color=COLORS["muted"],
+                    ),
+                    ft.Text("購入状況", weight=ft.FontWeight.W_600),
+                    purchase_status_field,
+                    quantity_field,
                 ], tight=True, scroll=ft.ScrollMode.ADAPTIVE),
                 width=520,
                 height=560,
@@ -370,12 +446,16 @@ def main(page: ft.Page):
         files = await image_picker.pick_files(
             file_type=ft.FilePickerFileType.IMAGE,
             allow_multiple=False,
+            with_data=True,
         )
         if not files:
             return
         uploaded = files[0]
-        source = Path(uploaded.path)
-        digest = hashlib.sha256(source.read_bytes()).hexdigest()
+        try:
+            target, digest = save_picked_image(uploaded)
+        except (OSError, ValueError) as error:
+            notify(f"画像を読み込めませんでした: {error}")
+            return
         matches = [item for item in data["items"] if item.get("image_hash") == digest]
         if matches:
             search_result_view.controls = [
@@ -383,9 +463,6 @@ def main(page: ft.Page):
                 ft.Column([ft.Row([item_image(item), ft.Text(item_name(item), expand=True)]) for item in matches]),
             ]
         else:
-            target = ASSET_DIR / f"{digest}{source.suffix or '.jpg'}"
-            if not target.exists():
-                shutil.copy2(source, target)
             search_result_view.controls = [
                 ft.Text("一致する所持グッズはありません。画像を新しい所持情報として登録できます。"),
                 ft.Image(src=str(target), height=220, fit=ft.BoxFit.CONTAIN),
@@ -419,16 +496,110 @@ def main(page: ft.Page):
     text_search = ft.TextField(label="商品名・作品名で検索", expand=True)
 
     def text_lookup(_):
-        query = normalize(text_search.value)
+        search_term = text_search.value.strip()
+        query = normalize(search_term)
         matches = [item for item in data["items"] if query in normalize(item_name(item))]
-        if matches:
-            search_result_view.controls = [ft.Text(f"所持庫に {len(matches)} 件あります", weight=ft.FontWeight.W_600), *[ft.Row([item_image(item), ft.Text(item_name(item), expand=True)]) for item in matches]]
-        elif query:
-            encoded = urllib.parse.quote(text_search.value)
-            search_result_view.controls = [ft.Text("所持庫にはありません"), ft.TextButton("Google で商品を検索", icon=ft.Icons.OPEN_IN_NEW, url=f"https://www.google.com/search?q={encoded}")]
-        else:
-            search_result_view.controls = [ft.Text("検索語を入力してください")]
+        if not query:
+            search_result_view.controls = [
+                ft.Text("商品名を入力して検索してください", color=COLORS["muted"]),
+                *[
+                    product_selection_card(item)
+                    for item in data["items"]
+                ],
+                ft.Button(
+                    "新しいグッズを登録",
+                    icon=ft.Icons.ADD,
+                    on_click=lambda _: add_manual(),
+                ),
+            ]
+            page.update()
+            return
+        search_result_view.controls = [
+            ft.Text(
+                f"所持庫に {len(matches)} 件あります" if matches else "所持庫にはありません",
+                weight=ft.FontWeight.W_600,
+            ),
+            *[product_selection_card(item) for item in matches],
+            ft.Container(
+                content=ft.Column(
+                    [
+                        ft.Text(
+                            f"「{search_term}」を登録",
+                            size=17,
+                            weight=ft.FontWeight.W_600,
+                            color=COLORS["ink"],
+                        ),
+                        ft.Text(
+                            "このボタンでアプリ内の商品登録に進みます。画像を選ぶか、商品画像URLを貼り付けてください。",
+                            size=12,
+                            color=COLORS["muted"],
+                        ),
+                        ft.Button(
+                            "この商品を選択して画像付きで登録",
+                            icon=ft.Icons.ADD_PHOTO_ALTERNATE,
+                            on_click=lambda _, value=search_term: add_manual({"name": value}),
+                        ),
+                    ],
+                    spacing=10,
+                ),
+                padding=16,
+                bgcolor=COLORS["green_light"],
+                border_radius=8,
+            ),
+            ft.TextButton(
+                "Google ショッピングで商品を確認（外部サイト）",
+                icon=ft.Icons.OPEN_IN_NEW,
+                url=google_shopping_url(search_term),
+            ),
+            ft.Text(
+                "外部サイトで商品を確認した後は、この画面で商品名を検索し直して上のボタンから登録してください。外部サイトの選択内容は自動では取り込まれません。",
+                size=11,
+                color=COLORS["muted"],
+            ),
+        ]
         page.update()
+
+    def product_selection_card(item):
+        status = item_purchase_status(item)
+        purchase_summary = (
+            f"購入済み ・ {item.get('quantity', 1)}個"
+            if status == "purchased"
+            else "購入予定"
+        )
+        return ft.Container(
+            content=ft.Row(
+                [
+                    item_image(item),
+                    ft.Column(
+                        [
+                            ft.Text(item_name(item), weight=ft.FontWeight.W_600),
+                            ft.Text(
+                                f"{purchase_summary} ・ ¥{item.get('price', 0):,}",
+                                size=12,
+                                color=COLORS["muted"],
+                            ),
+                            ft.Text(
+                                "このグッズを選択",
+                                size=12,
+                                color=COLORS["green"],
+                            ),
+                        ],
+                        expand=True,
+                        spacing=4,
+                    ),
+                    ft.Icon(ft.Icons.CHEVRON_RIGHT, color=COLORS["green"]),
+                ],
+                spacing=12,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+            padding=12,
+            bgcolor=COLORS["surface"],
+            border=ft.Border.all(1, COLORS["line"]),
+            border_radius=8,
+            ink=True,
+            tooltip="タップしてこのグッズを選択",
+            on_click=lambda _, value=item: add_manual(value),
+        )
 
     def delete_event(event_id):
         data["events"] = [event for event in data["events"] if event["id"] != event_id]
@@ -589,8 +760,11 @@ def main(page: ft.Page):
     ], spacing=14)
 
     search_layout = ft.Column([
-        ft.Text("検索", size=24, weight=ft.FontWeight.W_600),
-        card("商品名・所持情報", [ft.Row([text_search, ft.Button("検索", icon=ft.Icons.SEARCH, on_click=text_lookup)], spacing=8)]),
+        ft.Text("グッズ検索・選択", size=24, weight=ft.FontWeight.W_600),
+        card("グッズを検索して選択・登録", [
+            ft.Row([text_search, ft.Button("検索", icon=ft.Icons.SEARCH, on_click=text_lookup)], spacing=8),
+            ft.Text("商品名・作品名を入力すると、所持品から選ぶか新しいグッズとして登録できます。", size=12, color=COLORS["muted"]),
+        ]),
         card("バーコード", [ft.Row([barcode_search, ft.Button("照合", icon=ft.Icons.QR_CODE_SCANNER, on_click=lookup_barcode)], spacing=8), ft.Text("公開商品データベースで検索します", size=12, color=COLORS["muted"])]),
         card("画像検索", [ft.Row([ft.Button("画像を選ぶ", icon=ft.Icons.PHOTO_CAMERA, on_click=find_by_image), ft.Text("アップロード画像と所持画像の完全一致を検索", expand=True, color=COLORS["muted"])])]),
         search_result_view,
@@ -607,7 +781,7 @@ def main(page: ft.Page):
     ], spacing=14)
 
     nav_bar = ft.Container(
-        content=ft.Row([nav("collection", "所持品", ft.Icons.INVENTORY_2_OUTLINED), nav("search", "検索", ft.Icons.SEARCH), nav("calendar", "予定", ft.Icons.CALENDAR_MONTH_OUTLINED), nav("savings", "貯金", ft.Icons.SAVINGS_OUTLINED)], wrap=True),
+        content=ft.Row([nav("search", "グッズ検索・選択", ft.Icons.SEARCH), nav("collection", "所持品", ft.Icons.INVENTORY_2_OUTLINED), nav("calendar", "予定", ft.Icons.CALENDAR_MONTH_OUTLINED), nav("savings", "貯金", ft.Icons.SAVINGS_OUTLINED)], wrap=True),
         bgcolor=COLORS["surface"],
         padding=8,
         border=ft.Border.all(1, COLORS["line"]),
@@ -630,7 +804,19 @@ def main(page: ft.Page):
     render_collection()
     render_calendar()
     render_savings()
-    show_tab("collection")
+    search_result_view.controls = [
+        ft.Text(
+            "商品名・作品名を入力して検索するか、登録済みグッズを選択してください。",
+            color=COLORS["muted"],
+        ),
+        *[product_selection_card(item) for item in data["items"]],
+        ft.Button(
+            "新しいグッズを登録",
+            icon=ft.Icons.ADD,
+            on_click=lambda _: add_manual(),
+        ),
+    ]
+    show_tab("search")
 
 
 if __name__ == "__main__":
