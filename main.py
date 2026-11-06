@@ -189,6 +189,17 @@ def main(page: ft.Page):
                                 tooltip="登録内容を編集",
                                 on_click=lambda _, value=item: add_manual(value),
                             ),
+                            *(
+                                [
+                                    ft.TextButton(
+                                        "商品ページ",
+                                        icon=ft.Icons.OPEN_IN_NEW,
+                                        url=item["url"],
+                                    )
+                                ]
+                                if item.get("url")
+                                else []
+                            ),
                             ft.IconButton(ft.Icons.DELETE_OUTLINE, icon_color=COLORS["coral"], tooltip="削除", on_click=lambda event, item_id=item["id"]: delete_item(item_id)),
                         ],
                         spacing=12,
@@ -205,28 +216,28 @@ def main(page: ft.Page):
 
     def add_manual(item=None, *args):
         item = item if isinstance(item, dict) else {}
-        name_field = ft.TextField(label="商品名", value=item.get("name", ""), autofocus=True)
+        name_field = ft.TextField(label="商品名（必須）", value=item.get("name", ""), autofocus=True)
         brand_field = ft.TextField(label="ブランド・作品名", value=item.get("brand", ""))
         barcode_field = ft.TextField(label="バーコード", value=item.get("barcode", ""), keyboard_type=ft.KeyboardType.NUMBER)
         price_field = ft.TextField(label="購入金額", value=str(item.get("price", "")), keyboard_type=ft.KeyboardType.NUMBER)
         memo_field = ft.TextField(label="メモ", value=item.get("memo", ""), multiline=True, min_lines=2)
-        quantity_field = ft.TextField(
-            label="購入個数",
-            value=str(item.get("quantity", 1)),
-            keyboard_type=ft.KeyboardType.NUMBER,
+        product_url_field = ft.TextField(
+            label="商品ページURL（必須）",
+            value=item.get("url") or "",
+            hint_text="商品の販売ページURLを貼り付け",
+            keyboard_type=ft.KeyboardType.URL,
         )
-        item_image_url = item.get("image", "")
-        image_url_field = ft.TextField(
-            label="商品画像URL（画像アドレスを貼り付け）",
-            value=item_image_url if isinstance(item_image_url, str) and item_image_url.startswith(("http://", "https://")) else "",
-            hint_text="商品ページではなく画像そのもののURL",
+        quantity_field = ft.TextField(
+            label="購入個数（購入済みの場合必須）",
+            value=str(item.get("quantity", "")),
+            keyboard_type=ft.KeyboardType.NUMBER,
         )
         purchase_status_field = ft.RadioGroup(
             content=ft.Column([
                 ft.Radio(value="purchased", label="購入済み"),
                 ft.Radio(value="planned", label="購入予定"),
             ]),
-            value=item_purchase_status(item),
+            value=item_purchase_status(item) if item.get("id") else None,
         )
         search_name = ft.TextField(label="インターネット検索", hint_text="商品名・作品名", expand=True)
         search_barcode = ft.TextField(label="バーコード検索", hint_text="バーコード数字", expand=True, keyboard_type=ft.KeyboardType.NUMBER)
@@ -252,10 +263,16 @@ def main(page: ft.Page):
             if not name:
                 notify("商品名を入力してください")
                 return
+            if not price_field.value.strip():
+                notify("購入金額を入力してください")
+                return
             try:
-                price = max(0, int(price_field.value or 0))
+                price = int(price_field.value)
             except ValueError:
                 notify("購入金額は数字で入力してください")
+                return
+            if price < 0:
+                notify("購入金額は0以上で入力してください")
                 return
             try:
                 quantity = int(quantity_field.value or 0)
@@ -268,12 +285,14 @@ def main(page: ft.Page):
             if purchase_status == "purchased" and quantity < 1:
                 notify("購入個数は1以上で入力してください")
                 return
-            image_url = image_url_field.value.strip()
-            if image_url:
-                parsed_image_url = urllib.parse.urlsplit(image_url)
-                if parsed_image_url.scheme not in ("http", "https") or not parsed_image_url.netloc:
-                    notify("画像URLは http:// または https:// から始まるURLを入力してください")
-                    return
+            product_url = product_url_field.value.strip()
+            if not product_url:
+                notify("商品ページURLを入力してください")
+                return
+            parsed_product_url = urllib.parse.urlsplit(product_url)
+            if parsed_product_url.scheme not in ("http", "https") or not parsed_product_url.netloc:
+                notify("商品ページURLは http:// または https:// から始まるURLを入力してください")
+                return
             record = {
                 "id": item.get("id") or str(__import__("uuid").uuid4()),
                 "name": name,
@@ -281,12 +300,13 @@ def main(page: ft.Page):
                 "barcode": re.sub(r"\D", "", barcode_field.value),
                 "price": price,
                 "memo": memo_field.value.strip(),
+                "url": product_url,
                 "purchase_status": purchase_status,
                 "owned": purchase_status == "purchased",
                 "quantity": quantity,
-                "image": image_url or selected_image,
-                "image_path": "" if image_url else selected_image_path,
-                "image_hash": "" if image_url else selected_image_hash,
+                "image": selected_image,
+                "image_path": selected_image_path,
+                "image_hash": selected_image_hash,
             }
             existing = next((entry for entry in data["items"] if entry["id"] == record["id"]), None)
             if existing:
@@ -302,10 +322,10 @@ def main(page: ft.Page):
             name_field.value = candidate.get("name", "")
             brand_field.value = candidate.get("brand", "")
             barcode_field.value = candidate.get("barcode", "")
+            product_url_field.value = candidate.get("url") or ""
             selected_image = candidate.get("image") or ""
             selected_image_path = candidate.get("image_path", "")
             selected_image_hash = candidate.get("image_hash", "")
-            image_url_field.value = selected_image if selected_image.startswith(("http://", "https://")) else ""
             search_status.value = "候補を入力欄に反映しました"
             page.update()
 
@@ -381,11 +401,16 @@ def main(page: ft.Page):
             page.update()
 
         async def pick_registration_image(_):
-            files = await image_picker.pick_files(
-                file_type=ft.FilePickerFileType.IMAGE,
-                allow_multiple=False,
-                with_data=True,
-            )
+            try:
+                files = await image_picker.pick_files(
+                    file_type=ft.FilePickerFileType.IMAGE,
+                    allow_multiple=False,
+                    with_data=True,
+                    cancel_upload_on_window_blur=False,
+                )
+            except RuntimeError as error:
+                notify(f"画像を選択できませんでした: {error}")
+                return
             if not files:
                 return
             nonlocal selected_image, selected_image_path, selected_image_hash
@@ -397,7 +422,6 @@ def main(page: ft.Page):
             selected_image = ""
             selected_image_path = str(target)
             selected_image_hash = digest
-            image_url_field.value = ""
             search_status.value = "画像を選択しました。この画像もグッズと一緒に登録されます"
             search_candidates.controls = [
                 ft.Row([
@@ -414,18 +438,23 @@ def main(page: ft.Page):
                     ft.Text("インターネットから検索", weight=ft.FontWeight.W_600, color=COLORS["green"]),
                     ft.Row([search_name, ft.Button("商品名", icon=ft.Icons.SEARCH, on_click=search_name_online)], spacing=8),
                     ft.Row([search_barcode, ft.Button("バーコード", icon=ft.Icons.QR_CODE_SCANNER, on_click=search_barcode_online)], spacing=8),
-                    ft.Row([ft.Button("画像を選んで登録", icon=ft.Icons.PHOTO_CAMERA, on_click=pick_registration_image), ft.Text("選んだ画像はグッズと一緒に保存されます", expand=True, size=12, color=COLORS["muted"])], spacing=8),
+                    ft.Row([ft.Button("端末から画像を選択", icon=ft.Icons.PHOTO_CAMERA, on_click=pick_registration_image), ft.Text("選択した画像ファイルをアプリに保存します", expand=True, size=12, color=COLORS["muted"])], spacing=8),
                     search_status,
                     search_candidates,
                     ft.Divider(height=1),
+                    ft.Text(
+                        "必須: 商品名・商品ページURL・購入状況・購入金額。購入済みの場合は個数も必須です。画像・作品名/ブランド・バーコード・メモは任意です。",
+                        size=12,
+                        color=COLORS["muted"],
+                    ),
                     name_field,
                     brand_field,
                     barcode_field,
                     price_field,
                     memo_field,
-                    image_url_field,
+                    product_url_field,
                     ft.Text(
-                        "ショップの「画像アドレスをコピー」から貼り付けるか、画像ファイルを選択してください。",
+                        "商品ページURLを登録すると、所持品や検索結果から商品ページを開けます。画像は端末から選択できます。",
                         size=11,
                         color=COLORS["muted"],
                     ),
@@ -443,11 +472,16 @@ def main(page: ft.Page):
         page.update()
 
     async def find_by_image(_):
-        files = await image_picker.pick_files(
-            file_type=ft.FilePickerFileType.IMAGE,
-            allow_multiple=False,
-            with_data=True,
-        )
+        try:
+            files = await image_picker.pick_files(
+                file_type=ft.FilePickerFileType.IMAGE,
+                allow_multiple=False,
+                with_data=True,
+                cancel_upload_on_window_blur=False,
+            )
+        except RuntimeError as error:
+            notify(f"画像を選択できませんでした: {error}")
+            return
         if not files:
             return
         uploaded = files[0]
@@ -471,7 +505,7 @@ def main(page: ft.Page):
         page.update()
 
     image_picker = ft.FilePicker()
-    page.overlay.append(image_picker)
+    page.services.append(image_picker)
 
     def lookup_barcode(_):
         code = barcode_search.value.strip()
@@ -530,7 +564,7 @@ def main(page: ft.Page):
                             color=COLORS["ink"],
                         ),
                         ft.Text(
-                            "このボタンでアプリ内の商品登録に進みます。画像を選ぶか、商品画像URLを貼り付けてください。",
+                            "このボタンでアプリ内の商品登録に進みます。必要に応じて端末の画像ファイルを選択してください。",
                             size=12,
                             color=COLORS["muted"],
                         ),
@@ -582,6 +616,17 @@ def main(page: ft.Page):
                                 "このグッズを選択",
                                 size=12,
                                 color=COLORS["green"],
+                            ),
+                            *(
+                                [
+                                    ft.TextButton(
+                                        "商品ページを開く",
+                                        icon=ft.Icons.OPEN_IN_NEW,
+                                        url=item["url"],
+                                    )
+                                ]
+                                if item.get("url")
+                                else []
                             ),
                         ],
                         expand=True,
