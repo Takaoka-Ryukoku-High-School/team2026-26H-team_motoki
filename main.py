@@ -3,7 +3,7 @@ import json
 import re
 import urllib.parse
 import urllib.request
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 import flet as ft
@@ -123,6 +123,7 @@ def main(page: ft.Page):
     search_result_view = ft.Column(spacing=10)
     calendar_view = ft.Column(spacing=12)
     savings_view = ft.Column(spacing=12)
+    notification_list = ft.Column(spacing=8)
     snackbar = ft.SnackBar(content=ft.Text(""))
     page.overlay.append(snackbar)
 
@@ -130,6 +131,155 @@ def main(page: ft.Page):
         snackbar.content.value = message
         snackbar.open = True
         page.update()
+
+    def make_notification_row(label, detail, color=COLORS["muted"], on_click=None):
+        return ft.Container(
+            content=ft.Row([
+                ft.Container(width=8, height=8, bgcolor=color, border_radius=4),
+                ft.Column([
+                    ft.Text(label, size=13, weight=ft.FontWeight.W_600),
+                    ft.Text(detail, size=11, color=COLORS["muted"]),
+                ], expand=True, spacing=2),
+            ], vertical_alignment=ft.CrossAxisAlignment.START),
+            padding=10,
+            bgcolor=COLORS["surface"],
+            border=ft.Border.all(1, COLORS["line"]),
+            border_radius=8,
+            on_click=on_click,
+            ink=True,
+        )
+
+    def render_notifications():
+        notifications = []
+        today = date.today()
+        for event in sorted(data["events"], key=lambda entry: (entry.get("date", "9999-12-31"), entry.get("time", "23:59"))):
+            event_date_raw = (event.get("date") or "").strip()
+            event_time_raw = (event.get("time") or "00:00").strip()
+            if not event_date_raw:
+                continue
+            try:
+                event_dt = datetime.strptime(f"{event_date_raw} {event_time_raw}", "%Y-%m-%d %H:%M")
+            except ValueError:
+                continue
+            delta_days = (event_dt.date() - today).days
+            if delta_days < 0:
+                label = f"予定超過: {event.get('title', '予定')}"
+                detail = f"{event_date_raw} {event_time_raw}・予定を確認してください"
+                color = COLORS["coral"]
+            elif delta_days == 0:
+                label = f"本日: {event.get('title', '予定')}"
+                detail = f"{event_date_raw} {event_time_raw}・今日が予定日です"
+                color = COLORS["gold"]
+            elif delta_days <= 3:
+                label = f"もうすぐ: {event.get('title', '予定')}"
+                detail = f"{event_date_raw} {event_time_raw}・あと{delta_days}日"
+                color = COLORS["green"]
+            elif delta_days <= 7:
+                label = f"予定が近い: {event.get('title', '予定')}"
+                detail = f"{event_date_raw} {event_time_raw}・あと{delta_days}日"
+                color = COLORS["green_light"]
+            else:
+                continue
+            notifications.append(make_notification_row(label, detail, color=color, on_click=lambda _: show_tab("calendar")))
+
+        for item in data["items"]:
+            planned_date_raw = (item.get("planned_purchase_date") or "").strip()
+            if item_purchase_status(item) != "planned" or not planned_date_raw:
+                continue
+            try:
+                planned_date = date.fromisoformat(planned_date_raw)
+            except ValueError:
+                continue
+            delta_days = (planned_date - today).days
+            if delta_days < 0:
+                label = f"購入予定日超過: {item_name(item)}"
+                detail = f"{planned_date_raw}・購入予定日を過ぎています"
+                color = COLORS["coral"]
+            elif delta_days == 0:
+                label = f"本日購入予定: {item_name(item)}"
+                detail = f"{planned_date_raw}・今日が購入予定日です"
+                color = COLORS["gold"]
+            elif delta_days <= 7:
+                label = f"購入予定日が近い: {item_name(item)}"
+                detail = f"{planned_date_raw}・あと{delta_days}日です"
+                color = COLORS["green"]
+            else:
+                continue
+            notifications.append(
+                make_notification_row(
+                    label,
+                    detail,
+                    color=color,
+                    on_click=lambda _: show_tab("collection"),
+                )
+            )
+
+        for goal in data["goals"]:
+            target = max(1, goal.get("target", 0))
+            saved = goal.get("saved", 0)
+            if saved >= target:
+                continue
+
+            deadline_raw = (goal.get("deadline") or "").strip()
+            if deadline_raw:
+                try:
+                    deadline_date = date.fromisoformat(deadline_raw)
+                except ValueError:
+                    deadline_date = None
+                if deadline_date is not None:
+                    delta_days = (deadline_date - today).days
+                    if delta_days < 0:
+                        notifications.append(
+                            make_notification_row(
+                                f"貯金期限超過: {goal.get('name', '目標')}",
+                                f"{deadline_raw}・目標達成が遅れています",
+                                color=COLORS["coral"],
+                                on_click=lambda _: show_tab("savings"),
+                            )
+                        )
+                        continue
+                    if delta_days <= 7:
+                        notifications.append(
+                            make_notification_row(
+                                f"貯金期限が近い: {goal.get('name', '目標')}",
+                                f"{deadline_raw}・あと{delta_days}日です",
+                                color=COLORS["gold"],
+                                on_click=lambda _: show_tab("savings"),
+                            )
+                        )
+                        continue
+
+            percent = min(100, round(saved / target * 100))
+            if percent < 50:
+                notifications.append(
+                    make_notification_row(
+                        f"貯金目標: {goal.get('name', '目標')}",
+                        f"進捗 {percent}%・あと¥{target - saved:,}です",
+                        color=COLORS["gold"],
+                        on_click=lambda _, goal_name=goal.get("name", "目標"): show_tab("savings"),
+                    )
+                )
+
+        planned_items = [item for item in data["items"] if item_purchase_status(item) == "planned"]
+        if planned_items and len(notifications) < 3:
+            notifications.append(
+                make_notification_row(
+                    "購入予定のグッズがあります",
+                    f"未購入のグッズが{len(planned_items)}件あります",
+                    color=COLORS["green"],
+                    on_click=lambda _: show_tab("collection"),
+                )
+            )
+
+        notification_count = len(notifications)
+        notification_panel.content.controls[0].controls[1].content.value = str(notification_count) if notification_count else "0"
+        notification_panel.content.controls[0].controls[1].bgcolor = COLORS["green"] if notification_count else COLORS["muted"]
+        notification_panel.content.controls[1].controls = notifications[:5] if notifications else [
+            ft.Container(
+                content=ft.Text("新しい通知はありません", color=COLORS["muted"]),
+                padding=8,
+            )
+        ]
 
     def persist():
         try:
@@ -144,7 +294,7 @@ def main(page: ft.Page):
         if item.get("image_path"):
             path = Path(item["image_path"])
             if path.exists():
-                return ft.Image(src=str(path), width=72, height=72, fit=ft.BoxFit.COVER, border_radius=6)
+                return ft.Image(src=path.read_bytes(), width=72, height=72, fit=ft.BoxFit.COVER, border_radius=6)
         if item.get("image"):
             return ft.Image(src=item["image"], width=72, height=72, fit=ft.BoxFit.COVER, border_radius=6)
         return ft.Container(width=72, height=72, bgcolor=COLORS["green_light"], border_radius=6)
@@ -153,6 +303,7 @@ def main(page: ft.Page):
         data["items"] = [item for item in data["items"] if item["id"] != item_id]
         persist()
         render_collection()
+        render_calendar()
 
     def render_collection(query=""):
         query_key = normalize(query)
@@ -212,6 +363,7 @@ def main(page: ft.Page):
                 )
             )
         collection_view.controls = rows or [ft.Text("該当するグッズはありません", color=COLORS["muted"], text_align=ft.TextAlign.CENTER)]
+        render_notifications()
         page.update()
 
     def add_manual(item=None, *args):
@@ -239,6 +391,11 @@ def main(page: ft.Page):
             ]),
             value=item_purchase_status(item) if item.get("id") else None,
         )
+        planned_purchase_date_field = ft.TextField(
+            label="購入予定日（任意）",
+            value=item.get("planned_purchase_date", ""),
+            hint_text="YYYY-MM-DD",
+        )
         search_name = ft.TextField(label="インターネット検索", hint_text="商品名・作品名", expand=True)
         search_barcode = ft.TextField(label="バーコード検索", hint_text="バーコード数字", expand=True, keyboard_type=ft.KeyboardType.NUMBER)
         search_status = ft.Text(size=12, color=COLORS["muted"])
@@ -246,6 +403,42 @@ def main(page: ft.Page):
         selected_image = item.get("image", "")
         selected_image_path = item.get("image_path", "")
         selected_image_hash = item.get("image_hash", "")
+        image_preview = ft.Row(spacing=10, vertical_alignment=ft.CrossAxisAlignment.CENTER)
+
+        def render_registration_image():
+            if selected_image_path and Path(selected_image_path).exists():
+                preview = ft.Image(
+                    src=Path(selected_image_path).read_bytes(),
+                    width=72,
+                    height=72,
+                    fit=ft.BoxFit.COVER,
+                    border_radius=6,
+                )
+            elif selected_image:
+                preview = ft.Image(
+                    src=selected_image,
+                    width=72,
+                    height=72,
+                    fit=ft.BoxFit.COVER,
+                    border_radius=6,
+                )
+            else:
+                preview = ft.Container(
+                    content=ft.Text("未添付", size=11, color=COLORS["muted"]),
+                    width=72,
+                    height=72,
+                    bgcolor=COLORS["green_light"],
+                    border_radius=6,
+                    alignment=ft.Alignment.CENTER,
+                )
+            image_preview.controls = [
+                preview,
+                ft.Text(
+                    "画像を添付済み" if selected_image_path or selected_image else "画像は任意です",
+                    size=12,
+                    color=COLORS["muted"],
+                ),
+            ]
 
         def close(_=None):
             dialog.open = False
@@ -253,10 +446,12 @@ def main(page: ft.Page):
 
         def update_purchase_fields(_=None):
             quantity_field.visible = purchase_status_field.value == "purchased"
+            planned_purchase_date_field.visible = purchase_status_field.value == "planned"
             page.update()
 
         purchase_status_field.on_change = update_purchase_fields
         quantity_field.visible = purchase_status_field.value == "purchased"
+        planned_purchase_date_field.visible = purchase_status_field.value == "planned"
 
         def submit(_):
             name = name_field.value.strip()
@@ -285,6 +480,13 @@ def main(page: ft.Page):
             if purchase_status == "purchased" and quantity < 1:
                 notify("購入個数は1以上で入力してください")
                 return
+            planned_purchase_date = planned_purchase_date_field.value.strip()
+            if planned_purchase_date:
+                try:
+                    date.fromisoformat(planned_purchase_date)
+                except ValueError:
+                    notify("購入予定日は YYYY-MM-DD 形式で入力してください")
+                    return
             product_url = product_url_field.value.strip()
             if not product_url:
                 notify("商品ページURLを入力してください")
@@ -304,6 +506,7 @@ def main(page: ft.Page):
                 "purchase_status": purchase_status,
                 "owned": purchase_status == "purchased",
                 "quantity": quantity,
+                "planned_purchase_date": planned_purchase_date,
                 "image": selected_image,
                 "image_path": selected_image_path,
                 "image_hash": selected_image_hash,
@@ -316,6 +519,7 @@ def main(page: ft.Page):
             persist()
             close()
             render_collection()
+            render_calendar()
 
         def apply_candidate(candidate):
             nonlocal selected_image, selected_image_path, selected_image_hash
@@ -422,23 +626,24 @@ def main(page: ft.Page):
             selected_image = ""
             selected_image_path = str(target)
             selected_image_hash = digest
-            search_status.value = "画像を選択しました。この画像もグッズと一緒に登録されます"
-            search_candidates.controls = [
-                ft.Row([
-                    ft.Image(src=str(target), width=72, height=72, fit=ft.BoxFit.COVER, border_radius=6),
-                    ft.Text("登録する画像", color=COLORS["muted"]),
-                ]),
-            ]
+            render_registration_image()
+            search_status.value = "選択した画像はグッズと一緒に保存されます"
             page.update()
 
+        render_registration_image()
         dialog = ft.AlertDialog(
-            title=ft.Text("グッズを登録"),
+            title=ft.Text("グッズを編集" if item.get("id") else "グッズを登録"),
             content=ft.Container(
                 content=ft.Column([
                     ft.Text("インターネットから検索", weight=ft.FontWeight.W_600, color=COLORS["green"]),
                     ft.Row([search_name, ft.Button("商品名", icon=ft.Icons.SEARCH, on_click=search_name_online)], spacing=8),
                     ft.Row([search_barcode, ft.Button("バーコード", icon=ft.Icons.QR_CODE_SCANNER, on_click=search_barcode_online)], spacing=8),
-                    ft.Row([ft.Button("端末から画像を選択", icon=ft.Icons.PHOTO_CAMERA, on_click=pick_registration_image), ft.Text("選択した画像ファイルをアプリに保存します", expand=True, size=12, color=COLORS["muted"])], spacing=8),
+                    ft.Text("画像を添付", weight=ft.FontWeight.W_600, color=COLORS["green"]),
+                    ft.Row([
+                        ft.Button("端末のフォルダから画像を選択", icon=ft.Icons.PHOTO_CAMERA, on_click=pick_registration_image),
+                        image_preview,
+                    ], spacing=8),
+                    ft.Text("選択した画像ファイルはアプリ内に保存されます。", size=11, color=COLORS["muted"]),
                     search_status,
                     search_candidates,
                     ft.Divider(height=1),
@@ -460,12 +665,13 @@ def main(page: ft.Page):
                     ),
                     ft.Text("購入状況", weight=ft.FontWeight.W_600),
                     purchase_status_field,
+                    planned_purchase_date_field,
                     quantity_field,
                 ], tight=True, scroll=ft.ScrollMode.ADAPTIVE),
                 width=520,
                 height=560,
             ),
-            actions=[ft.TextButton("キャンセル", on_click=close), ft.Button("登録", on_click=submit)],
+            actions=[ft.TextButton("キャンセル", on_click=close), ft.Button("保存" if item.get("id") else "登録", on_click=submit)],
         )
         page.overlay.append(dialog)
         dialog.open = True
@@ -499,7 +705,7 @@ def main(page: ft.Page):
         else:
             search_result_view.controls = [
                 ft.Text("一致する所持グッズはありません。画像を新しい所持情報として登録できます。"),
-                ft.Image(src=str(target), height=220, fit=ft.BoxFit.CONTAIN),
+                ft.Image(src=target.read_bytes(), height=220, fit=ft.BoxFit.CONTAIN),
                 ft.Button("この画像で登録", on_click=lambda _: add_manual({"name": "", "image_path": str(target), "image_hash": digest})),
             ]
         page.update()
@@ -650,15 +856,62 @@ def main(page: ft.Page):
         data["events"] = [event for event in data["events"] if event["id"] != event_id]
         persist()
         render_calendar()
+        render_notifications()
 
     def render_calendar():
         rows = []
-        for event in sorted(data["events"], key=lambda entry: (entry["date"], entry["time"])):
+        schedule_entries = [
+            (event["date"], event["time"], "event", event)
+            for event in data["events"]
+        ]
+        for item in data["items"]:
+            planned_date = (item.get("planned_purchase_date") or "").strip()
+            if item_purchase_status(item) != "planned" or not planned_date:
+                continue
+            try:
+                date.fromisoformat(planned_date)
+            except ValueError:
+                continue
+            schedule_entries.append((planned_date, "12:00", "purchase", item))
+
+        for entry_date, entry_time, entry_type, entry in sorted(schedule_entries, key=lambda scheduled: (scheduled[0], scheduled[1])):
+            if entry_type == "purchase":
+                rows.append(
+                    ft.Container(
+                        content=ft.Row([
+                            ft.Column([
+                                ft.Text(entry_date, color=COLORS["green"], weight=ft.FontWeight.W_600),
+                                ft.Text("購入予定", size=12, color=COLORS["muted"]),
+                            ], width=85),
+                            ft.Column([
+                                ft.Text(f"購入予定: {item_name(entry)}"),
+                                ft.Text("変更は所持品の編集から行えます", size=12, color=COLORS["muted"]),
+                            ], expand=True),
+                            ft.IconButton(
+                                ft.Icons.EDIT_OUTLINED,
+                                tooltip="グッズ情報から購入予定日を変更",
+                                on_click=lambda _, value=entry: add_manual(value),
+                            ),
+                        ]),
+                        padding=12,
+                        bgcolor=COLORS["surface"],
+                        border=ft.Border.all(1, COLORS["line"]),
+                        border_radius=8,
+                    )
+                )
+                continue
+
+            event = entry
             rows.append(
                 ft.Container(
                     content=ft.Row([
                         ft.Column([ft.Text(event["date"], color=COLORS["green"], weight=ft.FontWeight.W_600), ft.Text(event["time"], size=12, color=COLORS["muted"])], width=85),
                         ft.Column([ft.Text(event["title"]), ft.Text(event.get("memo", ""), size=12, color=COLORS["muted"])], expand=True),
+                        ft.IconButton(
+                            ft.Icons.EDIT_OUTLINED,
+                            tooltip="予定を編集",
+                            on_click=lambda _, value=event: add_event(value),
+                        ),
                         ft.IconButton(ft.Icons.DELETE_OUTLINE, icon_color=COLORS["coral"], tooltip="削除", on_click=lambda _, event_id=event["id"]: delete_event(event_id)),
                     ]),
                     padding=12,
@@ -668,31 +921,49 @@ def main(page: ft.Page):
                 )
             )
         calendar_view.controls = rows or [ft.Text("予定はまだありません", color=COLORS["muted"])]
+        render_notifications()
         page.update()
 
-    def add_event(_):
-        title = ft.TextField(label="予定名", autofocus=True)
-        event_date = ft.TextField(label="日付", value=date.today().isoformat(), hint_text="YYYY-MM-DD")
-        event_time = ft.TextField(label="時刻", value="12:00", hint_text="HH:MM")
-        memo = ft.TextField(label="メモ", multiline=True, min_lines=2)
+    def add_event(event=None):
+        title = ft.TextField(label="予定名", value=event.get("title", "") if event else "", autofocus=True)
+        event_date = ft.TextField(label="日付", value=event.get("date", date.today().isoformat()) if event else date.today().isoformat(), hint_text="YYYY-MM-DD")
+        event_time = ft.TextField(label="時刻", value=event.get("time", "12:00") if event else "12:00", hint_text="HH:MM")
+        memo = ft.TextField(label="メモ", value=event.get("memo", "") if event else "", multiline=True, min_lines=2)
 
         def close(_=None):
             dialog.open = False
             page.update()
 
         def submit(_):
+            title_value = title.value.strip()
+            date_value = event_date.value.strip()
+            time_value = event_time.value.strip()
             try:
-                date.fromisoformat(event_date.value)
-                int(event_time.value[:2]), int(event_time.value[3:])
-            except (ValueError, IndexError):
+                date.fromisoformat(date_value)
+                datetime.strptime(time_value, "%H:%M")
+            except ValueError:
                 notify("日付と時刻の形式を確認してください")
                 return
-            data["events"].append({"id": str(__import__("uuid").uuid4()), "title": title.value.strip(), "date": event_date.value, "time": event_time.value, "memo": memo.value.strip()})
+            if not title_value:
+                notify("予定名を入力してください")
+                return
+            record = {
+                "id": event["id"] if event else str(__import__("uuid").uuid4()),
+                "title": title_value,
+                "date": date_value,
+                "time": time_value,
+                "memo": memo.value.strip(),
+            }
+            if event:
+                event.update(record)
+            else:
+                data["events"].append(record)
             persist()
             close()
             render_calendar()
+            render_notifications()
 
-        dialog = ft.AlertDialog(title=ft.Text("予定を追加"), content=ft.Container(ft.Column([title, event_date, event_time, memo]), width=420), actions=[ft.TextButton("キャンセル", on_click=close), ft.Button("追加", on_click=submit)])
+        dialog = ft.AlertDialog(title=ft.Text("予定を編集" if event else "予定を追加"), content=ft.Container(ft.Column([title, event_date, event_time, memo]), width=420), actions=[ft.TextButton("キャンセル", on_click=close), ft.Button("保存" if event else "追加", on_click=submit)])
         page.overlay.append(dialog)
         dialog.open = True
         page.update()
@@ -701,6 +972,7 @@ def main(page: ft.Page):
         data["goals"] = [goal for goal in data["goals"] if goal["id"] != goal_id]
         persist()
         render_savings()
+        render_notifications()
 
     def render_savings():
         rows = []
@@ -708,12 +980,34 @@ def main(page: ft.Page):
             target = max(1, goal["target"])
             saved = goal["saved"]
             percent = min(100, round(saved / target * 100))
+            deadline = (goal.get("deadline") or "").strip()
+            due_text = f"期限: {deadline}" if deadline else "期限: 未設定"
+            deadline_color = COLORS["muted"]
+            if deadline:
+                try:
+                    due_date = date.fromisoformat(deadline)
+                    if due_date < date.today():
+                        deadline_color = COLORS["coral"]
+                    elif (due_date - date.today()).days <= 7:
+                        deadline_color = COLORS["gold"]
+                except ValueError:
+                    due_text = f"期限: {deadline}（形式不備）"
+                    deadline_color = COLORS["coral"]
             rows.append(
                 ft.Container(
                     content=ft.Column([
-                        ft.Row([ft.Text(goal["name"], weight=ft.FontWeight.W_600, expand=True), ft.IconButton(ft.Icons.DELETE_OUTLINE, icon_color=COLORS["coral"], tooltip="削除", on_click=lambda _, goal_id=goal["id"]: delete_goal(goal_id))]),
+                        ft.Row([
+                            ft.Text(goal["name"], weight=ft.FontWeight.W_600, expand=True),
+                            ft.IconButton(
+                                ft.Icons.EDIT_OUTLINED,
+                                tooltip="貯金目標を編集",
+                                on_click=lambda _, value=goal: add_savings(value),
+                            ),
+                            ft.IconButton(ft.Icons.DELETE_OUTLINE, icon_color=COLORS["coral"], tooltip="削除", on_click=lambda _, goal_id=goal["id"]: delete_goal(goal_id)),
+                        ]),
                         ft.ProgressBar(value=saved / target, color=COLORS["green"], bgcolor=COLORS["green_light"]),
                         ft.Row([ft.Text(f"¥{saved:,}", weight=ft.FontWeight.W_600), ft.Text(f"目標 ¥{target:,} ・ {percent}%", color=COLORS["muted"])], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+                        ft.Text(due_text, size=12, color=deadline_color),
                     ], spacing=8),
                     padding=16,
                     bgcolor=COLORS["surface"],
@@ -722,12 +1016,14 @@ def main(page: ft.Page):
                 )
             )
         savings_view.controls = rows or [ft.Text("貯金目標はまだありません", color=COLORS["muted"])]
+        render_notifications()
         page.update()
 
     def add_savings(goal=None):
         name = ft.TextField(label="目標名", value=goal.get("name", "") if goal else "", autofocus=True)
         target = ft.TextField(label="目標額", value=str(goal.get("target", "")) if goal else "", keyboard_type=ft.KeyboardType.NUMBER)
         saved = ft.TextField(label="現在の貯蓄額", value=str(goal.get("saved", "")) if goal else "0", keyboard_type=ft.KeyboardType.NUMBER)
+        deadline = ft.TextField(label="達成予定日", value=str(goal.get("deadline", "")) if goal else "", hint_text="YYYY-MM-DD")
 
         def close(_=None):
             dialog.open = False
@@ -743,7 +1039,14 @@ def main(page: ft.Page):
             if target_value <= 0 or saved_value < 0:
                 notify("目標額と貯蓄額を確認してください")
                 return
-            record = {"id": goal["id"] if goal else str(__import__("uuid").uuid4()), "name": name.value.strip(), "target": target_value, "saved": saved_value}
+            deadline_value = deadline.value.strip()
+            if deadline_value:
+                try:
+                    date.fromisoformat(deadline_value)
+                except ValueError:
+                    notify("達成予定日は YYYY-MM-DD 形式で入力してください")
+                    return
+            record = {"id": goal["id"] if goal else str(__import__("uuid").uuid4()), "name": name.value.strip(), "target": target_value, "saved": saved_value, "deadline": deadline_value}
             if not record["name"]:
                 notify("目標名を入力してください")
                 return
@@ -754,8 +1057,9 @@ def main(page: ft.Page):
             persist()
             close()
             render_savings()
+            render_notifications()
 
-        dialog = ft.AlertDialog(title=ft.Text("貯金目標"), content=ft.Container(ft.Column([name, target, saved]), width=420), actions=[ft.TextButton("キャンセル", on_click=close), ft.Button("保存", on_click=submit)])
+        dialog = ft.AlertDialog(title=ft.Text("貯金目標"), content=ft.Container(ft.Column([name, target, saved, deadline]), width=420), actions=[ft.TextButton("キャンセル", on_click=close), ft.Button("保存", on_click=submit)])
         page.overlay.append(dialog)
         dialog.open = True
         page.update()
@@ -782,6 +1086,7 @@ def main(page: ft.Page):
             "calendar": calendar_layout,
             "savings": savings_layout,
         }[tab]
+        render_notifications()
         page.update()
 
     def nav(name, label, icon):
@@ -833,9 +1138,29 @@ def main(page: ft.Page):
         border_radius=8,
     )
 
+    notification_panel = ft.Container(
+        content=ft.Column([
+            ft.Row([
+                ft.Text("通知", size=16, weight=ft.FontWeight.W_600, color=COLORS["ink"]),
+                ft.Container(
+                    content=ft.Text("", size=11, weight=ft.FontWeight.W_600, color="white"),
+                    padding=ft.Padding.symmetric(horizontal=8, vertical=4),
+                    bgcolor=COLORS["green"],
+                    border_radius=12,
+                ),
+            ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+            notification_list,
+        ], spacing=8),
+        padding=14,
+        bgcolor=COLORS["surface"],
+        border=ft.Border.all(1, COLORS["line"]),
+        border_radius=8,
+    )
+
     shell = ft.Column([
         ft.Row([ft.Text("コレクト", size=15, weight=ft.FontWeight.W_700, color=COLORS["green"]), ft.Text("グッズ管理", size=12, color=COLORS["muted"])], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
         nav_bar,
+        notification_panel,
         content_area,
     ], width=760, spacing=16)
 
@@ -849,6 +1174,7 @@ def main(page: ft.Page):
     render_collection()
     render_calendar()
     render_savings()
+    render_notifications()
     search_result_view.controls = [
         ft.Text(
             "商品名・作品名を入力して検索するか、登録済みグッズを選択してください。",
