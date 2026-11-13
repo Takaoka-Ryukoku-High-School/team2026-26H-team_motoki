@@ -1,6 +1,13 @@
 import hashlib
+import hmac
 import json
+import logging
+import os
 import re
+import secrets
+import shutil
+import sqlite3
+import tempfile
 import urllib.parse
 import urllib.request
 from datetime import date, datetime
@@ -11,6 +18,9 @@ import flet as ft
 
 DATA_FILE = Path.home() / ".goods_organizer.json"
 ASSET_DIR = Path.home() / ".goods_organizer_images"
+AUTH_DB = Path.home() / ".goods_organizer_accounts.sqlite3"
+USER_DATA_DIR = Path.home() / ".goods_organizer_users"
+PASSWORD_ITERATIONS = 600_000
 
 COLORS = {
     "ink": "#26312D",
@@ -29,16 +39,135 @@ def default_data():
     return {"items": [], "events": [], "goals": []}
 
 
-def load_data():
+def load_data(data_file=DATA_FILE):
     try:
-        value = json.loads(DATA_FILE.read_text(encoding="utf-8"))
-        return value if isinstance(value, dict) else default_data()
-    except (OSError, json.JSONDecodeError):
+        value = json.loads(data_file.read_text(encoding="utf-8"))
+    except FileNotFoundError:
         return default_data()
+    if not isinstance(value, dict):
+        raise ValueError("保存データの形式が正しくありません")
+    return {**default_data(), **value}
 
 
-def save_data(data):
-    DATA_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+def ensure_private_directory(path):
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if os.name == "posix":
+        path.chmod(0o700)
+
+
+def save_data(data, data_file):
+    ensure_private_directory(data_file.parent)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=data_file.parent,
+            delete=False,
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+            json.dump(data, temporary_file, ensure_ascii=False, indent=2)
+        if os.name == "posix":
+            temporary_path.chmod(0o600)
+        os.replace(temporary_path, data_file)
+    finally:
+        if temporary_path and temporary_path.exists():
+            temporary_path.unlink()
+
+
+def user_storage_paths(email):
+    ensure_private_directory(USER_DATA_DIR)
+    user_key = hashlib.sha256(email.strip().casefold().encode("utf-8")).hexdigest()
+    return USER_DATA_DIR / f"{user_key}.json", USER_DATA_DIR / f"{user_key}_images"
+
+
+def initialize_auth_store():
+    AUTH_DB.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(AUTH_DB, timeout=10) as connection:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS accounts (
+                email TEXT PRIMARY KEY,
+                salt TEXT NOT NULL,
+                password_hash TEXT NOT NULL,
+                iterations INTEGER NOT NULL
+            )
+            """
+        )
+    if os.name == "posix":
+        AUTH_DB.chmod(0o600)
+
+
+def _password_hash(password, salt, iterations=None):
+    if iterations is None:
+        iterations = PASSWORD_ITERATIONS
+    return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations).hex()
+
+
+def migrate_legacy_images(data, target_asset_dir):
+    source_root = ASSET_DIR.resolve()
+    for item in data.get("items", []):
+        source_value = item.get("image_path")
+        if not source_value:
+            continue
+        try:
+            source = Path(source_value).resolve(strict=True)
+            source.relative_to(source_root)
+        except (OSError, ValueError):
+            continue
+        if not source.is_file():
+            continue
+        ensure_private_directory(target_asset_dir)
+        target = target_asset_dir / source.name
+        shutil.copyfile(source, target)
+        if os.name == "posix":
+            target.chmod(0o600)
+        item["image_path"] = str(target)
+
+
+def create_account(email, password):
+    email = email.strip().casefold()
+    if len(email) > 254 or not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+        raise ValueError("メールアドレスを確認してください")
+    if not 12 <= len(password) <= 128:
+        raise ValueError("パスワードの長さを確認してください")
+    salt = secrets.token_bytes(16)
+    password_hash = _password_hash(password, salt)
+    connection = sqlite3.connect(AUTH_DB, timeout=10)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        if connection.execute("SELECT 1 FROM accounts WHERE email = ?", (email,)).fetchone():
+            connection.rollback()
+            return False
+        first_account = not connection.execute("SELECT 1 FROM accounts LIMIT 1").fetchone()
+        connection.execute(
+            "INSERT INTO accounts (email, salt, password_hash, iterations) VALUES (?, ?, ?, ?)",
+            (email, salt.hex(), password_hash, PASSWORD_ITERATIONS),
+        )
+        if first_account and DATA_FILE.exists():
+            legacy_data = load_data(DATA_FILE)
+            data_file, asset_dir = user_storage_paths(email)
+            migrate_legacy_images(legacy_data, asset_dir)
+            save_data(legacy_data, data_file)
+        connection.commit()
+        return True
+    finally:
+        connection.close()
+
+
+def authenticate_account(email, password):
+    email = email.strip().casefold()
+    with sqlite3.connect(AUTH_DB, timeout=10) as connection:
+        account = connection.execute(
+            "SELECT salt, password_hash, iterations FROM accounts WHERE email = ?",
+            (email,),
+        ).fetchone()
+    if account is None:
+        hmac.compare_digest(_password_hash(password, b"goods-organizer-dummy-salt"), "0" * 64)
+        return False
+    salt, expected_hash, iterations = account
+    actual_hash = _password_hash(password, bytes.fromhex(salt), iterations)
+    return hmac.compare_digest(actual_hash, expected_hash)
 
 
 def normalize(value):
@@ -54,7 +183,7 @@ def google_shopping_url(query):
     return f"https://www.google.com/search?{params}"
 
 
-def save_picked_image(file):
+def save_picked_image(file, asset_dir):
     content = file.bytes
     if content is None:
         if not file.path:
@@ -66,9 +195,12 @@ def save_picked_image(file):
         suffix = Path(file.name).suffix
 
     digest = hashlib.sha256(content).hexdigest()
-    target = ASSET_DIR / f"{digest}{suffix or '.jpg'}"
+    ensure_private_directory(asset_dir)
+    target = asset_dir / f"{digest}{suffix or '.jpg'}"
     if not target.exists():
         target.write_bytes(content)
+        if os.name == "posix":
+            target.chmod(0o600)
     return target, digest
 
 
@@ -115,8 +247,11 @@ def main(page: ft.Page):
     page.horizontal_alignment = ft.CrossAxisAlignment.CENTER
     page.scroll = ft.ScrollMode.ADAPTIVE
 
-    data = load_data()
-    ASSET_DIR.mkdir(parents=True, exist_ok=True)
+    initialize_auth_store()
+    data = default_data()
+    current_user_email = None
+    current_data_file = None
+    current_asset_dir = None
 
     active_tab = "collection"
     collection_view = ft.Column(spacing=12)
@@ -282,8 +417,11 @@ def main(page: ft.Page):
         ]
 
     def persist():
+        if current_data_file is None:
+            notify("ログインしてからデータを保存してください")
+            return
         try:
-            save_data(data)
+            save_data(data, current_data_file)
         except OSError:
             notify("保存できませんでした。ストレージの容量や権限を確認してください")
 
@@ -300,10 +438,32 @@ def main(page: ft.Page):
         return ft.Container(width=72, height=72, bgcolor=COLORS["green_light"], border_radius=6)
 
     def delete_item(item_id):
-        data["items"] = [item for item in data["items"] if item["id"] != item_id]
-        persist()
-        render_collection()
-        render_calendar()
+        item = next((entry for entry in data["items"] if entry["id"] == item_id), None)
+        if item is None:
+            return
+
+        def close(_=None):
+            dialog.open = False
+            page.update()
+
+        def confirm(_):
+            data["items"] = [entry for entry in data["items"] if entry["id"] != item_id]
+            persist()
+            close()
+            render_collection()
+            render_calendar()
+
+        dialog = ft.AlertDialog(
+            title=ft.Text("グッズを削除"),
+            content=ft.Text(f"「{item_name(item)}」を削除しますか？この操作は取り消せません。"),
+            actions=[
+                ft.TextButton("キャンセル", on_click=close),
+                ft.Button("削除", on_click=confirm),
+            ],
+        )
+        page.overlay.append(dialog)
+        dialog.open = True
+        page.update()
 
     def render_collection(query=""):
         query_key = normalize(query)
@@ -351,7 +511,11 @@ def main(page: ft.Page):
                                 if item.get("url")
                                 else []
                             ),
-                            ft.IconButton(ft.Icons.DELETE_OUTLINE, icon_color=COLORS["coral"], tooltip="削除", on_click=lambda event, item_id=item["id"]: delete_item(item_id)),
+                            ft.TextButton(
+                                "削除",
+                                icon=ft.Icons.DELETE_OUTLINE,
+                                on_click=lambda _, item_id=item["id"]: delete_item(item_id),
+                            ),
                         ],
                         spacing=12,
                         vertical_alignment=ft.CrossAxisAlignment.CENTER,
@@ -605,6 +769,10 @@ def main(page: ft.Page):
             page.update()
 
         async def pick_registration_image(_):
+            asset_dir = current_asset_dir
+            if asset_dir is None:
+                notify("画像を保存するにはログインしてください")
+                return
             try:
                 files = await image_picker.pick_files(
                     file_type=ft.FilePickerFileType.IMAGE,
@@ -619,7 +787,7 @@ def main(page: ft.Page):
                 return
             nonlocal selected_image, selected_image_path, selected_image_hash
             try:
-                target, digest = save_picked_image(files[0])
+                target, digest = save_picked_image(files[0], asset_dir)
             except (OSError, ValueError) as error:
                 notify(f"画像を読み込めませんでした: {error}")
                 return
@@ -678,6 +846,10 @@ def main(page: ft.Page):
         page.update()
 
     async def find_by_image(_):
+        asset_dir = current_asset_dir
+        if asset_dir is None:
+            notify("画像を検索するにはログインしてください")
+            return
         try:
             files = await image_picker.pick_files(
                 file_type=ft.FilePickerFileType.IMAGE,
@@ -692,7 +864,7 @@ def main(page: ft.Page):
             return
         uploaded = files[0]
         try:
-            target, digest = save_picked_image(uploaded)
+            target, digest = save_picked_image(uploaded, asset_dir)
         except (OSError, ValueError) as error:
             notify(f"画像を読み込めませんでした: {error}")
             return
@@ -1085,6 +1257,7 @@ def main(page: ft.Page):
             "search": search_layout,
             "calendar": calendar_layout,
             "savings": savings_layout,
+            "safety": safety_layout,
         }[tab]
         render_notifications()
         page.update()
@@ -1130,8 +1303,42 @@ def main(page: ft.Page):
         savings_view,
     ], spacing=14)
 
+    safety_layout = ft.Column([
+        ft.Text("安心・データについて", size=24, weight=ft.FontWeight.W_600),
+        card("AI・センサー利用の倫理配慮", [
+            ft.Text(
+                "AIによる自動判定や、カメラ・位置情報などのセンサーによる自動取得は行いません。"
+                "画像は利用者が選択します。人物が写った画像を使う場合は、本人の許可を得てください。"
+                "バーコードの商品候補は、登録前に内容を確認できます。",
+                size=13,
+                color=COLORS["muted"],
+            ),
+        ]),
+        card("データの扱い・安全性", [
+            ft.Text(
+                "メールアドレスをログインIDとして登録し、パスワードはハッシュ化して保存します。"
+                "グッズ・予定・貯金目標と画像はアカウントごとに分けて、アプリ実行端末に保存します。"
+                "データ自体は暗号化していません。メール確認とパスワード再設定には対応していません。"
+                "バーコード照合では番号をOpen Food Factsへ送信し、"
+                "Google ショッピングを開くと入力した検索語がGoogleへ送信されます。"
+                "個人情報をメモや検索語に入力しないでください。",
+                size=13,
+                color=COLORS["muted"],
+            ),
+        ]),
+        card("利用者が安心して使うために", [
+            ft.Text(
+                "グッズ・予定・貯金目標は画面から個別に確認・編集・削除できます。"
+                "画像検索は、選んだ画像と登録画像の一致を端末内で確認します。"
+                "共有端末では利用後にログアウトしてください。画像ファイルは端末のファイル管理からも確認できます。",
+                size=13,
+                color=COLORS["muted"],
+            ),
+        ]),
+    ], spacing=14)
+
     nav_bar = ft.Container(
-        content=ft.Row([nav("search", "グッズ検索・選択", ft.Icons.SEARCH), nav("collection", "所持品", ft.Icons.INVENTORY_2_OUTLINED), nav("calendar", "予定", ft.Icons.CALENDAR_MONTH_OUTLINED), nav("savings", "貯金", ft.Icons.SAVINGS_OUTLINED)], wrap=True),
+        content=ft.Row([nav("search", "グッズ検索・選択", ft.Icons.SEARCH), nav("collection", "所持品", ft.Icons.INVENTORY_2_OUTLINED), nav("calendar", "予定", ft.Icons.CALENDAR_MONTH_OUTLINED), nav("savings", "貯金", ft.Icons.SAVINGS_OUTLINED), nav("safety", "安心・データ", ft.Icons.SHIELD_OUTLINED)], wrap=True),
         bgcolor=COLORS["surface"],
         padding=8,
         border=ft.Border.all(1, COLORS["line"]),
@@ -1157,38 +1364,168 @@ def main(page: ft.Page):
         border_radius=8,
     )
 
+    auth_mode = "login"
+    auth_title = ft.Text("ログイン", size=20, weight=ft.FontWeight.W_600)
+    auth_status = ft.Text("", size=12, color=COLORS["coral"])
+    email_field = ft.TextField(
+        label="メールアドレス",
+        keyboard_type=ft.KeyboardType.EMAIL,
+        autofocus=True,
+    )
+    password_field = ft.TextField(
+        label="パスワード",
+        password=True,
+        can_reveal_password=True,
+    )
+    password_confirm_field = ft.TextField(
+        label="パスワード（確認）",
+        password=True,
+        can_reveal_password=True,
+        visible=False,
+    )
+    auth_submit_button = ft.Button("ログイン")
+    auth_mode_button = ft.TextButton("アカウントを新規作成")
+    logout_button = ft.TextButton("ログアウト", icon=ft.Icons.LOGOUT)
+    auth_shell = ft.Column([
+        ft.Text("コレクト | グッズ管理", size=18, weight=ft.FontWeight.W_700, color=COLORS["green"]),
+        card("アカウント", [
+            auth_title,
+            email_field,
+            password_field,
+            password_confirm_field,
+            auth_submit_button,
+            auth_mode_button,
+            auth_status,
+            ft.Text(
+                "メールアドレスはログインIDとして使います。確認メール・パスワード再設定はありません。"
+                "最初に登録したアカウントには、以前のローカルデータがあれば移行されます。"
+                "公開リンクを共有する前に、所有者が最初に登録してください。",
+                size=11,
+                color=COLORS["muted"],
+            ),
+        ]),
+    ], width=480, spacing=16)
+
     shell = ft.Column([
-        ft.Row([ft.Text("コレクト", size=15, weight=ft.FontWeight.W_700, color=COLORS["green"]), ft.Text("グッズ管理", size=12, color=COLORS["muted"])], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+        ft.Row([
+            ft.Text("コレクト", size=15, weight=ft.FontWeight.W_700, color=COLORS["green"]),
+            ft.Text("グッズ管理", size=12, color=COLORS["muted"], expand=True),
+            logout_button,
+        ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
         nav_bar,
         notification_panel,
         content_area,
-    ], width=760, spacing=16)
+    ], width=760, spacing=16, visible=False)
+
+    def set_auth_mode(mode):
+        nonlocal auth_mode
+        auth_mode = mode
+        is_registering = mode == "register"
+        auth_title.value = "アカウント作成" if is_registering else "ログイン"
+        auth_submit_button.text = "登録してログイン" if is_registering else "ログイン"
+        auth_mode_button.text = "ログインに戻る" if is_registering else "アカウントを新規作成"
+        password_confirm_field.visible = is_registering
+        auth_status.value = ""
+        page.update()
+
+    def open_account(email):
+        nonlocal current_user_email, current_data_file, current_asset_dir
+        data_file, asset_dir = user_storage_paths(email)
+        account_data = load_data(data_file)
+        ensure_private_directory(asset_dir)
+        data.clear()
+        data.update(account_data)
+        current_user_email = email
+        current_data_file = data_file
+        current_asset_dir = asset_dir
+        search_result_view.controls = [
+            ft.Text(
+                "商品名・作品名を入力して検索するか、登録済みグッズを選択してください。",
+                color=COLORS["muted"],
+            ),
+            *[product_selection_card(item) for item in data["items"]],
+            ft.Button(
+                "新しいグッズを登録",
+                icon=ft.Icons.ADD,
+                on_click=lambda _: add_manual(),
+            ),
+        ]
+        auth_shell.visible = False
+        shell.visible = True
+        render_collection()
+        render_calendar()
+        render_savings()
+        render_notifications()
+        show_tab("search")
+
+    def submit_auth(_):
+        email = email_field.value.strip().casefold()
+        password = password_field.value
+        if len(email) > 254 or not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+            auth_status.value = "メールアドレスを正しく入力してください"
+            page.update()
+            return
+        if not password or len(password) > 128:
+            auth_status.value = "パスワードを入力してください（128文字以内）"
+            page.update()
+            return
+
+        try:
+            if auth_mode == "register":
+                if len(password) < 12:
+                    auth_status.value = "パスワードは12文字以上で設定してください"
+                    page.update()
+                    return
+                if password != password_confirm_field.value:
+                    auth_status.value = "確認用パスワードが一致しません"
+                    page.update()
+                    return
+                if not create_account(email, password):
+                    auth_status.value = "このメールアドレスはすでに登録されています"
+                    page.update()
+                    return
+            elif not authenticate_account(email, password):
+                auth_status.value = "メールアドレスかパスワードが違います"
+                page.update()
+                return
+            open_account(email)
+            password_field.value = ""
+            password_confirm_field.value = ""
+        except (OSError, sqlite3.Error, ValueError):
+            logging.exception("Account operation failed")
+            auth_status.value = "アカウントを処理できませんでした。管理者にお問い合わせください"
+            page.update()
+
+    def logout(_):
+        nonlocal auth_mode, current_user_email, current_data_file, current_asset_dir
+        data.clear()
+        data.update(default_data())
+        current_user_email = None
+        current_data_file = None
+        current_asset_dir = None
+        password_field.value = ""
+        password_confirm_field.value = ""
+        shell.visible = False
+        auth_shell.visible = True
+        set_auth_mode("login")
+        page.update()
+
+    auth_submit_button.on_click = submit_auth
+    auth_mode_button.on_click = lambda _: set_auth_mode(
+        "register" if auth_mode == "login" else "login"
+    )
+    logout_button.on_click = logout
 
     def resize(event):
         width = page.width or 760
         shell.width = min(760, max(280, width - 32))
+        auth_shell.width = min(480, max(280, width - 32))
         page.update()
 
     page.on_resize = resize
-    page.add(shell)
-    render_collection()
-    render_calendar()
-    render_savings()
-    render_notifications()
-    search_result_view.controls = [
-        ft.Text(
-            "商品名・作品名を入力して検索するか、登録済みグッズを選択してください。",
-            color=COLORS["muted"],
-        ),
-        *[product_selection_card(item) for item in data["items"]],
-        ft.Button(
-            "新しいグッズを登録",
-            icon=ft.Icons.ADD,
-            on_click=lambda _: add_manual(),
-        ),
-    ]
-    show_tab("search")
+    page.add(auth_shell, shell)
+    page.update()
 
 
 if __name__ == "__main__":
-    ft.run(main, view=ft.AppView.WEB_BROWSER, port=8000)
+    ft.run(main, host="0.0.0.0", view=ft.AppView.WEB_BROWSER, port=8000)
