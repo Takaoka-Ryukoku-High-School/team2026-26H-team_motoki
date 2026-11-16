@@ -252,6 +252,8 @@ def main(page: ft.Page):
     current_user_email = None
     current_data_file = None
     current_asset_dir = None
+    guest_temp_dir = None
+    is_guest = False
 
     active_tab = "collection"
     collection_view = ft.Column(spacing=12)
@@ -417,6 +419,8 @@ def main(page: ft.Page):
         ]
 
     def persist():
+        if is_guest:
+            return
         if current_data_file is None:
             notify("ログインしてからデータを保存してください")
             return
@@ -1330,7 +1334,8 @@ def main(page: ft.Page):
             ft.Text(
                 "グッズ・予定・貯金目標は画面から個別に確認・編集・削除できます。"
                 "画像検索は、選んだ画像と登録画像の一致を端末内で確認します。"
-                "共有端末では利用後にログアウトしてください。画像ファイルは端末のファイル管理からも確認できます。",
+                "アカウント利用時の画像ファイルは端末のファイル管理からも確認できます。"
+                "ゲスト利用のデータは一時的にメモリと一時領域だけに保存され、ページ切断時に破棄されます。",
                 size=13,
                 color=COLORS["muted"],
             ),
@@ -1385,6 +1390,7 @@ def main(page: ft.Page):
     )
     auth_submit_button = ft.Button("ログイン")
     auth_mode_button = ft.TextButton("アカウントを新規作成")
+    guest_button = ft.OutlinedButton("アカウントなしでゲスト利用")
     logout_button = ft.TextButton("ログアウト", icon=ft.Icons.LOGOUT)
     auth_shell = ft.Column([
         ft.Text("コレクト | グッズ管理", size=18, weight=ft.FontWeight.W_700, color=COLORS["green"]),
@@ -1395,6 +1401,7 @@ def main(page: ft.Page):
             password_confirm_field,
             auth_submit_button,
             auth_mode_button,
+            guest_button,
             auth_status,
             ft.Text(
                 "メールアドレスはログインIDとして使います。確認メール・パスワード再設定はありません。"
@@ -1403,15 +1410,27 @@ def main(page: ft.Page):
                 size=11,
                 color=COLORS["muted"],
             ),
+            ft.Text(
+                "ゲスト利用のデータはこのページを開いている間だけ保持され、ログアウトまたはページ切断時に破棄されます。",
+                size=11,
+                color=COLORS["muted"],
+            ),
         ]),
     ], width=480, spacing=16)
 
+    guest_notice = ft.Text(
+        "ゲスト利用中です。このページを離れるとデータは破棄されます。",
+        size=12,
+        color=COLORS["coral"],
+        visible=False,
+    )
     shell = ft.Column([
         ft.Row([
             ft.Text("コレクト", size=15, weight=ft.FontWeight.W_700, color=COLORS["green"]),
             ft.Text("グッズ管理", size=12, color=COLORS["muted"], expand=True),
             logout_button,
         ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+        guest_notice,
         nav_bar,
         notification_panel,
         content_area,
@@ -1430,6 +1449,10 @@ def main(page: ft.Page):
 
     def open_account(email):
         nonlocal current_user_email, current_data_file, current_asset_dir
+        nonlocal guest_temp_dir, is_guest
+        if guest_temp_dir is not None:
+            guest_temp_dir.cleanup()
+            guest_temp_dir = None
         data_file, asset_dir = user_storage_paths(email)
         account_data = load_data(data_file)
         ensure_private_directory(asset_dir)
@@ -1438,6 +1461,12 @@ def main(page: ft.Page):
         current_user_email = email
         current_data_file = data_file
         current_asset_dir = asset_dir
+        is_guest = False
+        guest_notice.visible = False
+        logout_button.text = "ログアウト"
+        activate_app()
+
+    def activate_app():
         search_result_view.controls = [
             ft.Text(
                 "商品名・作品名を入力して検索するか、登録済みグッズを選択してください。",
@@ -1457,6 +1486,23 @@ def main(page: ft.Page):
         render_savings()
         render_notifications()
         show_tab("search")
+
+    def open_guest(_):
+        nonlocal current_user_email, current_data_file, current_asset_dir
+        nonlocal guest_temp_dir, is_guest
+        data.clear()
+        data.update(default_data())
+        guest_temp_dir = tempfile.TemporaryDirectory(prefix="goods-organizer-guest-")
+        current_user_email = None
+        current_data_file = None
+        current_asset_dir = Path(guest_temp_dir.name) / "images"
+        ensure_private_directory(current_asset_dir)
+        is_guest = True
+        guest_notice.visible = True
+        logout_button.text = "アカウントでログイン"
+        auth_shell.visible = False
+        shell.visible = True
+        activate_app()
 
     def submit_auth(_):
         email = email_field.value.strip().casefold()
@@ -1498,11 +1544,18 @@ def main(page: ft.Page):
 
     def logout(_):
         nonlocal auth_mode, current_user_email, current_data_file, current_asset_dir
+        nonlocal guest_temp_dir, is_guest
         data.clear()
         data.update(default_data())
+        if guest_temp_dir is not None:
+            guest_temp_dir.cleanup()
+            guest_temp_dir = None
         current_user_email = None
         current_data_file = None
         current_asset_dir = None
+        is_guest = False
+        guest_notice.visible = False
+        logout_button.text = "ログアウト"
         password_field.value = ""
         password_confirm_field.value = ""
         shell.visible = False
@@ -1510,11 +1563,21 @@ def main(page: ft.Page):
         set_auth_mode("login")
         page.update()
 
+    def cleanup_guest_session(_):
+        nonlocal guest_temp_dir, current_asset_dir, is_guest
+        if guest_temp_dir is not None:
+            guest_temp_dir.cleanup()
+            guest_temp_dir = None
+        current_asset_dir = None
+        is_guest = False
+
     auth_submit_button.on_click = submit_auth
     auth_mode_button.on_click = lambda _: set_auth_mode(
         "register" if auth_mode == "login" else "login"
     )
     logout_button.on_click = logout
+    guest_button.on_click = open_guest
+    page.on_disconnect = cleanup_guest_session
 
     def resize(event):
         width = page.width or 760
@@ -1524,7 +1587,7 @@ def main(page: ft.Page):
 
     page.on_resize = resize
     page.add(auth_shell, shell)
-    page.update()
+    open_guest(None)
 
 
 if __name__ == "__main__":
