@@ -50,9 +50,9 @@ python main.py
 
 ## 公開リンク
 
-現在の Codespaces 環境では、ポート `8000` を公開しています。
+現在の Codespaces 環境では、ポート `8001` を公開しています。
 
-https://squalid-troll-jr9vprp9qgwvf5w5w-8000.app.github.dev
+https://squalid-troll-jr9vprp9qgwvf5w5w-8001.app.github.dev
 
 Codespaces を停止すると公開リンクは一時的に利用できません。再開した後は次のコマンドでアプリを起動し直してください。
 
