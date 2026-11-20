@@ -47,3 +47,28 @@ python main.py
 ```
 
 起動するとブラウザでアプリが開きます。
+
+## 公開リンク
+
+現在の Codespaces 環境では、ポート `8000` を公開しています。
+
+https://squalid-troll-jr9vprp9qgwvf5w5w-8000.app.github.dev
+
+Codespaces を停止すると公開リンクは一時的に利用できません。再開した後は次のコマンドでアプリを起動し直してください。
+
+```bash
+source .venv/bin/activate
+nohup python main.py >/tmp/collect.log 2>&1 &
+gh codespace ports visibility 8000:public
+```
+
+## 無料ホスティング（Render）
+
+Codespacesを停止してもリンクを維持できるよう、Renderで公開できます。
+
+1. https://dashboard.render.com に GitHubアカウントでログイン
+2. **New** → **Blueprint** を選択
+3. このリポジトリを接続
+4. `render.yaml` を検出してデプロイを実行
+
+無料プランでは一定時間アクセスがないとスリープし、次のアクセス時に起動します。

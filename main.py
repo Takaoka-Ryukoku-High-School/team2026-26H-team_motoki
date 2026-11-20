@@ -1591,4 +1591,5 @@ def main(page: ft.Page):
 
 
 if __name__ == "__main__":
-    ft.run(main, host="0.0.0.0", view=ft.AppView.WEB_BROWSER, port=8000)
+    port = int(os.environ.get("PORT", "8000"))
+    ft.run(main, host="0.0.0.0", view=ft.AppView.WEB_BROWSER, port=port)

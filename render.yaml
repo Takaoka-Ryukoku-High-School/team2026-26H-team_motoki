@@ -1,0 +1,8 @@
+services:
+  - type: web
+    name: collect-goods-organizer
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    plan: free
+    healthCheckPath: /
